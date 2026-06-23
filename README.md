@@ -1,30 +1,21 @@
-# Finance alert — Kotak SMS trigger + Balance API + Telegram
+# Finance alert — Kotak SMS → Telegram
 
-Fires on **every transaction** (via your bank's SMS), tells you the amount,
-how much **budget** you have left this month, and the **real account balance**
-(`EFFAVL`) pulled live from Kotak's Balance Enquiry API. Warns you once when
-your monthly spend crosses **₹10,000**.
+Fires on **every transaction** (via your bank's SMS), tells you the amount and
+how much **budget** you have left this month. Warns you once when your monthly
+spend crosses the limit set in `.env`.
 
 ```
 You swipe card
    │  bank sends SMS instantly
    ▼
-iPhone "Automation: When I get a message from <bank>"  ── the real trigger
+iPhone Automation: "When I get a message from <bank>"
    │  POSTs the SMS text to this server
    ▼
-server.py ─► parse amount ─► Kotak Balance Enquiry API (EFFAVL)
-   │                           │
-   ▼                           ▼
-SQLite (monthly total)   Telegram message to your phone
+server.py ─► parse amount + merchant
+   │
+   ├─► SQLite (monthly total)
+   └─► Telegram message to your phone
 ```
-
-## Why this shape
-
-Kotak's Balance Enquiry API is **pull-only** — it has no webhook, so it cannot
-itself "trigger" on a transaction. Your bank's **transaction SMS** is the real
-real-time trigger; the API is used right after to read the authoritative
-**EFFAVL** ("Effective Available" — the balance after lien/other liabilities,
-which the doc says is the one to consume).
 
 ## Files
 
@@ -32,76 +23,102 @@ which the doc says is the one to consume).
 |------|---------|
 | `server.py`    | Flask server; `/transaction` endpoint the Shortcut hits |
 | `parse_sms.py` | Pulls amount/merchant out of the SMS text |
-| `kotak.py`     | OAuth + FIXML balance enquiry + parses `EFFAVL` |
 | `core.py`      | Records spend, computes month total, sends alerts |
 | `db.py`        | SQLite storage |
 | `notify.py`    | Telegram sender |
 | `config.py`    | Loads `.env` |
+| `Dockerfile`   | Container image for the Flask server |
+| `docker-compose.yml` | Runs the server + ngrok tunnel together |
 
 ## Setup
 
-### 1. Install
+### 1. Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Fill in:
+
+| Variable | Where to get it |
+|----------|----------------|
+| `TELEGRAM_BOT_TOKEN` | Message **@BotFather** → `/newbot` |
+| `TELEGRAM_CHAT_ID` | Send any message to your bot, open `https://api.telegram.org/bot<TOKEN>/getUpdates`, copy `chat.id` |
+| `WEBHOOK_SECRET` | Any random string — used to authenticate the Shortcut |
+| `NGROK_AUTHTOKEN` | [dashboard.ngrok.com/authtokens](https://dashboard.ngrok.com/authtokens) |
+| `MONTHLY_BUDGET` | Your monthly spend limit in ₹ |
+
+### 2. Start with Docker
+
 ```bash
 cd ~/finance-alert
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env      # then edit .env
+touch finance.db          # create DB file if it doesn't exist yet
+docker compose up -d
 ```
 
-### 2. Telegram bot
-1. Message **@BotFather** → `/newbot` → copy the **token** into `TELEGRAM_BOT_TOKEN`.
-2. Send any message to your new bot.
-3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates`, find `chat.id`, put it
-   in `TELEGRAM_CHAT_ID`.
+This starts two containers:
+- **app** — the Flask server on port 5000
+- **ngrok** — public HTTPS tunnel to the server
 
-### 3. Kotak credentials
-Fill the `KOTAK_*` values in `.env` from the tech doc + the OAuth/auth doc Kotak
-gives you. UAT values from your doc are already prefilled in `.env.example`.
-Leave `MOCK_KOTAK=1` while testing without live credentials.
+### 3. Get your ngrok URL
 
-> The balance-enquiry doc doesn't cover the OAuth handshake. `kotak.py` assumes
-> a standard OAuth2 `client_credentials` grant with HTTP Basic auth. If Kotak's
-> auth doc differs, adjust `get_token()` and the request headers in `kotak.py`.
-
-### 4. Test it locally (mock mode)
 ```bash
-# in .env set MOCK_KOTAK=1
-source .venv/bin/activate
-python server.py            # starts on http://0.0.0.0:5000
+curl http://localhost:4040/api/tunnels
 ```
-In another terminal:
+
+Or open `http://localhost:4040` in a browser. You'll see a URL like:
+```
+https://xxxx-xx-xx-xx-xx.ngrok-free.app
+```
+
+Use this in your iPhone Shortcut.
+
+### 4. Test it
+
 ```bash
-curl -X POST "http://localhost:5000/transaction?secret=YOUR_WEBHOOK_SECRET" \
+curl -X POST "https://YOUR_NGROK_URL/transaction?secret=YOUR_WEBHOOK_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"sms":"Sent Rs.500.00 from Kotak Bank AC X1234 to cafe@upi on 16-06-25"}'
 ```
-You should get a Telegram message and a JSON response.
 
-### 5. Make the server reachable from your phone
-- **Same Wi-Fi (simplest):** use your Mac's LAN IP, e.g. `http://192.168.1.5:5000`.
-  Only works when phone + Mac are on the same network and the Mac is awake.
-- **Anywhere (recommended):** run `ngrok http 5000` and use the public
-  `https://...ngrok...` URL, or deploy `server.py` to a small always-on host
-  (Railway / Fly / a VPS).
+You should get a Telegram message.
 
-### 6. iOS Shortcut (the trigger)
-On your iPhone, open the **Shortcuts** app → **Automation** tab → **+**:
-1. **When I get a message** → choose the sender/bank (or "Message contains" a
-   keyword like "debited" / "Kotak").
-2. Turn **Run Immediately** ON (no confirmation tap).
+### 5. iOS Shortcut (the trigger)
+
+Open **Shortcuts** → **Automation** tab → **+**:
+
+1. **When I get a message** → filter by your bank sender name (e.g. "Kotak")
+2. Turn **Run Immediately** ON (no confirmation tap needed)
 3. Add action **Get Contents of URL**:
-   - URL: `https://YOUR_SERVER/transaction?secret=YOUR_WEBHOOK_SECRET`
+   - URL: `https://YOUR_NGROK_URL/transaction?secret=YOUR_WEBHOOK_SECRET`
    - Method: **POST**
-   - Request Body: **JSON**, one field `sms` = the **Shortcut "Message" variable**.
-4. Save. Now every matching bank SMS auto-POSTs to your server.
+   - Request Body: **JSON**, one field — key `sms`, value = the blue **Message** variable from the trigger
+4. Save
 
-## Running it for real
-- Set `MOCK_KOTAK=0` once your Kotak credentials work.
-- Keep `server.py` running (a host, or `ngrok` + your Mac).
-- Spend money → get a Telegram ping with amount, budget left, and live balance.
+Now every matching bank SMS fires the shortcut automatically.
+
+## Docker commands
+
+```bash
+# Start in background
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+
+# Rebuild after code changes
+docker compose up -d --build
+```
 
 ## Tuning
-- Edit the regexes in `parse_sms.py` to match your bank's exact SMS wording
-  (the raw SMS is always stored in SQLite so you can refine against real data).
-- Change `MONTHLY_BUDGET` in `.env`.
-- Inspect data: `sqlite3 finance.db "select * from transactions;"`
+
+- Edit regexes in `parse_sms.py` to match your bank's exact SMS wording — the raw SMS is always stored in SQLite so you can refine against real data
+- Change `MONTHLY_BUDGET` in `.env`, then restart: `docker compose up -d`
+- Inspect transactions: `sqlite3 finance.db "select * from transactions;"`
+
+## Note on uptime
+
+Docker on Mac runs inside a VM that pauses when your Mac sleeps. The Shortcut will fail while the Mac is asleep. For true 24/7 uptime, deploy to a cloud host (Railway, Render, Fly, or a VPS).
