@@ -13,7 +13,7 @@ services:
     image: ngrok/ngrok:latest
     command: http app:5000
     environment:
-      - NGROK_AUTHTOKEN=2k9k2SHOvhhKBsEM4YEHSSUmhsa_51YSzsSer1R1Kr3LEj1rT
+      - NGROK_AUTHTOKEN=YOUR-NGROK-AUTH-TOKEN
     ports:
       - "4040:4040"
     depends_on:
